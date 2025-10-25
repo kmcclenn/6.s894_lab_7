@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #include <random>
+#include <type_traits>
 #include <vector>
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -158,7 +159,20 @@ compute_middle_sums(size_t n, typename Op::Data const *x, typename Op::Data *out
 
     __syncthreads();
 
-// prefix sum on
+    // prefix sum on
+    Data to_add = Op::identity();
+    // if (std::is_arithmetic_v<Data>) {
+
+    //     for (int i = 1; i < MIDDLE_THREADS; i <<= 1) {
+    //         accumulator = Op::combine(
+    //             accumulator,
+    //             reinterpret_cast<Data>(__shfl_up_sync(
+    //                 0xffffffff,
+    //                 reinterpret_cast<int>(accumulator),
+    //                 i * (threadIdx.x >= i))));
+    //     }
+    //     to_add = accumulator;
+    // } else {
 #pragma unroll
     for (int i = 1; i < MIDDLE_THREADS; i <<= 1) {
 
@@ -171,8 +185,9 @@ compute_middle_sums(size_t n, typename Op::Data const *x, typename Op::Data *out
 
         __syncthreads();
     }
+    to_add = shmem[SHMEM_PADDING(threadIdx.x)];
+    // }
 
-    Data to_add = shmem[SHMEM_PADDING(threadIdx.x)];
     //(threadIdx.x == 0) ? Op::identity() : shmem[threadIdx.x - 1]; //
 
     for (int i = 0; i < base_case; i++) {
