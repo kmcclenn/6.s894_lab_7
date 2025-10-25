@@ -53,6 +53,7 @@ namespace scan_gpu {
 #define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
 #define BASE (BLOCK / (THREAD_X * THREAD_Y))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MIDDLE_THREADS (32 * 32)
 
 /* TODO: your GPU kernels here... */
 template <typename Op>
@@ -66,65 +67,57 @@ __global__ void compute_sums(
     using Data = typename Op::Data;
     Data accumulator = Op::identity();
 
-    int offset = blockIdx.x * BLOCK + threadIdx.x * BASE;
+    size_t offset = blockIdx.x * BLOCK + threadIdx.x * BASE;
 
     Data const *x_block = x + offset;
     Data *out_block = out + offset;
 
-    // NAIVE
-    // for (size_t i = 0; i < n; i++) {
-    //     accumulator = Op::combine(accumulator, x_block[i]);
-    //     out_block[i] = accumulator;
-    // }
+    size_t remaining = total_n - offset;
+    int less_than_base = remaining < BASE;
+    size_t loop_bound = less_than_base * remaining + (1 - less_than_base) * BASE;
+
+    if (offset >= total_n)
+        return;
 
     extern __shared__ __align__(16) char shmem_raw[];
     Data *shmem = reinterpret_cast<Data *>(shmem_raw);
 
-    // partial sum from threadIdx block
-
-    for (int i = 0; i < BASE; i++) {
+    for (size_t i = 0; i < loop_bound; i++) { // BASE
         accumulator = Op::combine(accumulator, x_block[i]);
-        if (offset + i < total_n)
-            out_block[i] = accumulator;
+        out_block[i] = accumulator;
     }
-    shmem[threadIdx.x] = (threadIdx.x >= n) ? Op::identity() : accumulator;
+    shmem[0] = Op::identity();
+    shmem[threadIdx.x + 1] = accumulator;
+    //(threadIdx.x >= n) ? Op::identity() : accumulator;
 
     __syncthreads();
 
     // prefix sum on
-    for (int i = 1; i < blockDim.x; i <<= 1) {
+    int num_threads = CEIL_DIV(MIN(BLOCK, total_n), BASE);
 
-        Data add = Op::identity();
-        if (threadIdx.x >= i) {
-            add = shmem[threadIdx.x - i];
-        }
+#pragma unroll
+    for (int i = 1; i < num_threads; i <<= 1) {
+
+        Data add = (threadIdx.x >= i) ? shmem[threadIdx.x - i] : Op::identity();
+
         __syncthreads();
-        if (threadIdx.x >= i) {
 
-            shmem[threadIdx.x] = Op::combine(add, shmem[threadIdx.x]);
-        }
+        shmem[threadIdx.x] = Op::combine(add, shmem[threadIdx.x]);
+        // }
         __syncthreads();
     }
 
-    Data to_add = (threadIdx.x == 0) ? Op::identity() : shmem[threadIdx.x - 1]; //
+    Data to_add = shmem[threadIdx.x]; //
 
-    for (int i = 0; i < BASE; i++) {
-        // if (threadIdx.x > 0) {
-        // printf("inner %d\n", threadIdx.x);
-        if (offset + i < total_n)
-            out_block[i] = Op::combine(to_add, out_block[i]); //
+    for (int i = 0; i < loop_bound; i++) {
 
-        //
-        // }
+        // if (offset + i < total_n)
+        out_block[i] = Op::combine(to_add, out_block[i]); //
     }
     // __syncthreads();
     if (threadIdx.x == blockDim.x - 1) {
-        // printf("adding to end sum bix %d\n", n / BASE);
-        // if (total_n != 1000000) {
+
         end_sums[blockIdx.x] = out_block[BASE - 1];
-        // } else {
-        //     // end_sums[blockIdx.x] = out_block[0];
-        // }
     }
 }
 
@@ -135,18 +128,15 @@ compute_middle_sums(size_t n, typename Op::Data const *x, typename Op::Data *out
     using Data = typename Op::Data;
     Data accumulator = Op::identity();
 
-    int base_case = CEIL_DIV(n, blockDim.x);
+    int base_case = CEIL_DIV(n, MIDDLE_THREADS);
 
     int offset = threadIdx.x * base_case; // hardcoded to 4
 
     Data const *x_block = x + offset;
     Data *out_block = out + offset;
 
-    // NAIVE
-    // for (size_t i = 0; i < n; i++) {
-    //     accumulator = Op::combine(accumulator, x_block[i]);
-    //     out_block[i] = accumulator;
-    // }
+    // if (offset >= n)
+    //     return;
 
     extern __shared__ __align__(16) char shmem_raw[];
     Data *shmem = reinterpret_cast<Data *>(shmem_raw);
@@ -157,48 +147,42 @@ compute_middle_sums(size_t n, typename Op::Data const *x, typename Op::Data *out
         accumulator = Op::combine(accumulator, x_block[i]);
         out_block[i] = accumulator;
     }
-    shmem[threadIdx.x] = (threadIdx.x >= n) ? Op::identity() : accumulator;
+    shmem[0] = Op::identity();
+    shmem[threadIdx.x + 1] = accumulator;
+    //(threadIdx.x >= n) ? Op::identity() : accumulator;
 
     __syncthreads();
 
-    // prefix sum on
-    for (int i = 1; i < blockDim.x; i <<= 1) {
+// prefix sum on
+#pragma unroll
+    for (int i = 1; i < MIDDLE_THREADS; i <<= 1) {
 
-        Data add = Op::identity();
-        if (threadIdx.x >= i) {
-            add = shmem[threadIdx.x - i];
-        }
+        Data add = (threadIdx.x >= i) ? shmem[threadIdx.x - i] : Op::identity();
+
         __syncthreads();
-        if (threadIdx.x >= i) {
+        shmem[threadIdx.x] = Op::combine(add, shmem[threadIdx.x]);
 
-            shmem[threadIdx.x] = Op::combine(add, shmem[threadIdx.x]);
-        }
         __syncthreads();
     }
 
-    Data to_add = (threadIdx.x == 0) ? Op::identity() : shmem[threadIdx.x - 1]; //
+    Data to_add = shmem[threadIdx.x];
+    //(threadIdx.x == 0) ? Op::identity() : shmem[threadIdx.x - 1]; //
 
     for (int i = 0; i < base_case; i++) {
-        // if (threadIdx.x > 0) {
-        // printf("inner %d\n", threadIdx.x);
         out_block[i] = Op::combine(to_add, out_block[i]); //
-
-        //
-        // }
     }
 }
 
-template <typename Op>
-__global__ void combine_sums(int num_blocks, typename Op::Data *arr) {
-    using Data = typename Op::Data;
-    Data total = arr[BLOCK - 1];
-    for (int i = 2; i < num_blocks; i++) {
-        total = Op::combine(total, arr[i * BLOCK - 1]);
-        // std::cout << i << std::endl;
-        arr[i * BLOCK - 1] = total;
-    }
-    // int base_case = num_blocks / blockDim.x;
-}
+// template <typename Op>
+// __global__ void combine_sums(int num_blocks, typename Op::Data *arr) {
+//     using Data = typename Op::Data;
+//     Data total = arr[BLOCK - 1];
+//     for (int i = 2; i < num_blocks; i++) {
+//         total = Op::combine(total, arr[i * BLOCK - 1]);
+//         // std::cout << i << std::endl;
+//         arr[i * BLOCK - 1] = total;
+//     }
+// }
 
 template <typename Op>
 __global__ void fill_blocks(
@@ -209,16 +193,11 @@ __global__ void fill_blocks(
     using Data = typename Op::Data;
     Data *arr = workspace + (blockIdx.x + 1) * BLOCK;
 
-    // printf("%d\n", blockIdx.x);
     Data base = end_sums[blockIdx.x]; //*(arr - 1);
-    int end = (blockIdx.x == gridDim.x - 1) ? ((total_n - 1) % BLOCK) + 1 : n - 1; //
-    // // printf("end %d\n", end);
-    // int end = n - (1 - (blockIdx.x == gridDim.x - 1));
+    int end = (blockIdx.x == gridDim.x - 1) ? ((total_n - 1) % BLOCK) + 1 : n; //
 
     for (size_t i = threadIdx.x; i < end; i += blockDim.x) {
-        // if (threadIdx.x == blockDim.x - 1 && blockIdx.x == gridDim.x - 1) {
-        //     printf("%d\n", i);
-        // }
+
         arr[i] = Op::combine(base, arr[i]);
     }
 }
@@ -280,7 +259,7 @@ typename Op::Data *launch_scan(
     int num_blocks = CEIL_DIV(n, BLOCK);
     Data *end_points = arr + n;
     Data *end_points_write = end_points + num_blocks;
-    // std::cout << num_blocks << std::endl;
+    // std::cout << "num blocks: " << num_blocks << std::endl;
     int shmem_bytes = sizeof(Data) * (THREAD_X * THREAD_Y);
 
     int num_threads = CEIL_DIV(MIN(BLOCK, n), BASE); // should be 1024 at max sizes
@@ -288,28 +267,13 @@ typename Op::Data *launch_scan(
     compute_sums<Op>
         <<<num_blocks, num_threads, shmem_bytes>>>(BLOCK, x, arr, end_points, n);
 
-    // print_array<Op>(16, end_points);
-
-    // combine partial sums
-    combine_sums<Op><<<1, 1>>>(num_blocks, arr);
-
-    // if (n > BLOCK) {
-
-    // std::cout << num_blocks
-
-    compute_middle_sums<Op><<<1, 32 * 32, 32 * 32 * sizeof(Data)>>>(
+    compute_middle_sums<Op><<<1, MIDDLE_THREADS, MIDDLE_THREADS * sizeof(Data)>>>(
         num_blocks,
         end_points,
         end_points_write);
 
-    const Data *con = end_points_write;
-
-    // if (n >= 1000000) {
-    //     print_array<Op>(16, end_points);
-    // }
-
     // fill in intermediate
-    // std::cout << num_blocks - 1 << " threads: " << num_threads << std::endl;
+
     fill_blocks<Op><<<num_blocks - 1, num_threads>>>(BLOCK, arr, n, end_points_write);
     // }
 
