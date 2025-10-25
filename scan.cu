@@ -47,14 +47,135 @@ void scan_cpu(size_t n, typename Op::Data const *x, typename Op::Data *out) {
 // Optimized GPU Implementation
 
 namespace scan_gpu {
+#define THREAD_X 32
+#define THREAD_Y 32
+#define BLOCK (1 << 12)
+#define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
+#define BASE (BLOCK / (THREAD_X * THREAD_Y))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 /* TODO: your GPU kernels here... */
+template <typename Op>
+__global__ void
+compute_sums(size_t n, typename Op::Data const *x, typename Op::Data *out) {
+    using Data = typename Op::Data;
+    Data accumulator = Op::identity();
+
+    int offset = blockIdx.x * BLOCK + threadIdx.x * BASE;
+
+    Data const *x_block = x + offset;
+    Data *out_block = out + offset;
+
+    // NAIVE
+    // for (size_t i = 0; i < n; i++) {
+    //     accumulator = Op::combine(accumulator, x_block[i]);
+    //     out_block[i] = accumulator;
+    // }
+
+    extern __shared__ __align__(16) char shmem_raw[];
+    Data *shmem = reinterpret_cast<Data *>(shmem_raw);
+
+    // partial sum from threadIdx block
+
+    for (int i = 0; i < BASE; i++) {
+        accumulator = Op::combine(accumulator, x_block[i]);
+        out_block[i] = accumulator;
+    }
+    shmem[threadIdx.x] = (threadIdx.x >= n) ? Op::identity() : accumulator;
+
+    __syncthreads();
+
+    // prefix sum on
+    for (int i = 1; i < blockDim.x; i <<= 1) {
+
+        Data add = Op::identity();
+        if (threadIdx.x >= i) {
+            add = shmem[threadIdx.x - i];
+        }
+        __syncthreads();
+        if (threadIdx.x >= i) {
+
+            shmem[threadIdx.x] = Op::combine(add, shmem[threadIdx.x]);
+        }
+        __syncthreads();
+    }
+
+    // Data acc = Op::identity();
+    // for (int i = 0; i < 32; i++) {
+    //     acc = Op::combine(acc, shmem[i]);
+    //     shmem[i] = acc;
+    // }
+    // printf("tix: %d\n", threadIdx.x);
+    Data to_add = (threadIdx.x == 0) ? Op::identity() : shmem[threadIdx.x - 1]; //
+
+    for (int i = 0; i < BASE; i++) {
+        // if (threadIdx.x > 0) {
+        // printf("inner %d\n", threadIdx.x);
+        out_block[i] = Op::combine(to_add, out_block[i]); //
+
+        //
+        // }
+    }
+    // __syncthreads();
+    // if (threadIdx.x == blockDim.x - 1) {
+    //     end_sums[blockIdx.x] = out_block[BASE - 1];
+    // }
+}
+
+template <typename Op>
+__global__ void combine_sums(int num_blocks, typename Op::Data *arr) {
+    using Data = typename Op::Data;
+    Data total = arr[BLOCK - 1];
+    for (int i = 2; i < num_blocks; i++) {
+        total = Op::combine(total, arr[i * BLOCK - 1]);
+        // std::cout << i << std::endl;
+        arr[i * BLOCK - 1] = total;
+    }
+    // int base_case = num_blocks / blockDim.x;
+
+    // Data acc = Op::identity();
+    // for (int i = 0; i < base_case; i++) {
+    //     int base = (threadIdx.x*base_case + i)*BASE - 1;
+    //     acc = Op::combine(acc, arr[base]);
+    //     arr[base] = acc;
+    // }
+
+    // for (int i = 1; i < num_blocks; i <<= 1) {
+    //     int base = (threadIdx.x*base_case + i)*BASE;
+    //     Data add = Op::identity();
+    //     if (threadIdx.x >= i) {
+    //         add = arr[threadIdx.x - base - 1];
+    //     }
+    //     __syncthreads();
+    //     if (threadIdx.x >= i) {
+
+    //         arr[threadIdx.x] = Op::combine(add, arr[threadIdx.x]);
+    //     }
+    //     __syncthreads();
+    // }
+}
+
+template <typename Op>
+__global__ void fill_blocks(size_t n, typename Op::Data *workspace, size_t total_n) {
+    using Data = typename Op::Data;
+    Data *arr = workspace + (blockIdx.x + 1) * BLOCK;
+
+    // printf("%d\n", blockIdx.x);
+    Data base = *(arr - 1);
+    int end = (blockIdx.x == gridDim.x - 1) ? ((total_n - 1) % BLOCK) + 1 : n - 1;
+    // printf("end %d\n", end);
+    for (size_t i = threadIdx.x; i < end; i += blockDim.x) {
+        // accumulator = Op::combine(accumulator, arr[i]);
+        // printf("%d\n", i);
+        arr[i] = Op::combine(base, arr[i]);
+    }
+}
 
 // Returns desired size of scratch buffer in bytes.
 template <typename Op> size_t get_workspace_size(size_t n) {
     using Data = typename Op::Data;
     /* TODO: your CPU code here... */
-    return 0;
+    return n * sizeof(Data) + 3 * CEIL_DIV(n, BLOCK) * sizeof(Data);
 }
 
 // 'launch_scan'
@@ -92,6 +213,7 @@ template <typename Op> size_t get_workspace_size(size_t n) {
 //
 //    Op::combine(a, b) == Op::combine(b, a) // not true in general!
 //
+
 template <typename Op>
 typename Op::Data *launch_scan(
     size_t n,
@@ -100,7 +222,37 @@ typename Op::Data *launch_scan(
 ) {
     using Data = typename Op::Data;
     /* TODO: your CPU code here... */
-    return nullptr; // replace with an appropriate pointer
+    Data *arr = reinterpret_cast<Data *>(workspace); // size n
+
+    // compute sums per block
+    int num_blocks = CEIL_DIV(n, BLOCK);
+    Data *end_points = arr + n;
+    Data *end_points_write = end_points + num_blocks;
+    std::cout << num_blocks << std::endl;
+    int shmem_bytes = sizeof(Data) * (THREAD_X * THREAD_Y);
+
+    int num_threads = CEIL_DIV(MIN(BLOCK, n), BASE);
+
+    compute_sums<Op><<<num_blocks, num_threads, shmem_bytes>>>(BLOCK, x, arr);
+
+    // print_array<Op>(16, end_points);
+
+    // combine partial sums
+    combine_sums<Op><<<1, 1>>>(num_blocks, arr);
+
+    // if (n > BLOCK) {
+
+    // compute_sums<Op><<<1, 32 * 32, 32 * 32 * sizeof(Data)>>>(
+    //     num_blocks,
+    //     end_points,
+    //     end_points_write,
+    //     end_points_write + num_blocks);
+
+    // fill in intermediate
+    fill_blocks<Op><<<num_blocks - 1, num_threads>>>(BLOCK, arr, n);
+    // }
+
+    return arr; // replace with an appropriate pointer
 }
 
 } // namespace scan_gpu
@@ -211,8 +363,9 @@ template <typename Op> void print_array(size_t n, typename Op::Data const *x) {
     printf("]\n");
 
     if (total_print_array_output >= max_print_array_output) {
-        printf("(Reached maximum limit on 'print_array' output; skipping further calls "
-               "to 'print_array')\n");
+        printf(
+            "(Reached maximum limit on 'print_array' output; skipping further calls "
+            "to 'print_array')\n");
     }
 
     total_print_array_output++;

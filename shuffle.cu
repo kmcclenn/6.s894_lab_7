@@ -25,13 +25,11 @@ __global__ void no_shuffle_kernel(data_type *src, clock_type *dst) {
 
     // Your code goes here
     mem[threadIdx.x] = val;
-
     for (int i = 0; i < 5; ++i) {
+        __syncwarp();
         if (threadIdx.x >= (1 << i)) {
-
             mem[threadIdx.x] = mem[threadIdx.x] + mem[threadIdx.x - (1 << i)];
         }
-        __syncthreads();
     }
 
     end_time = clock_cycle();
@@ -55,7 +53,7 @@ __global__ void shuffle_kernel(data_type *src, clock_type *dst) {
 
     for (int i = 0; i < 5; ++i) {
         val += __shfl_up_sync(0xffffffff, val, (1 << i)) * (threadIdx.x >= (1 << i));
-        __syncthreads();
+        // __syncwarp();
     }
 
     end_time = clock_cycle();
