@@ -55,6 +55,9 @@ namespace scan_gpu {
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MIDDLE_THREADS (32 * 32)
 
+#define PAD 32
+#define SHMEM_PADDING(idx) ((idx) + ((idx) / PAD))
+
 /* TODO: your GPU kernels here... */
 template <typename Op>
 __global__ void compute_sums(
@@ -87,7 +90,7 @@ __global__ void compute_sums(
         out_block[i] = accumulator;
     }
     shmem[0] = Op::identity();
-    shmem[threadIdx.x + 1] = accumulator;
+    shmem[SHMEM_PADDING(threadIdx.x + 1)] = accumulator;
     //(threadIdx.x >= n) ? Op::identity() : accumulator;
 
     __syncthreads();
@@ -98,16 +101,18 @@ __global__ void compute_sums(
 #pragma unroll
     for (int i = 1; i < num_threads; i <<= 1) {
 
-        Data add = (threadIdx.x >= i) ? shmem[threadIdx.x - i] : Op::identity();
+        Data add =
+            (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : Op::identity();
 
         __syncthreads();
 
-        shmem[threadIdx.x] = Op::combine(add, shmem[threadIdx.x]);
+        shmem[SHMEM_PADDING(threadIdx.x)] =
+            Op::combine(add, shmem[SHMEM_PADDING(threadIdx.x)]);
         // }
         __syncthreads();
     }
 
-    Data to_add = shmem[threadIdx.x]; //
+    Data to_add = shmem[SHMEM_PADDING(threadIdx.x)]; //
 
     for (int i = 0; i < loop_bound; i++) {
 
@@ -148,7 +153,7 @@ compute_middle_sums(size_t n, typename Op::Data const *x, typename Op::Data *out
         out_block[i] = accumulator;
     }
     shmem[0] = Op::identity();
-    shmem[threadIdx.x + 1] = accumulator;
+    shmem[SHMEM_PADDING(threadIdx.x + 1)] = accumulator;
     //(threadIdx.x >= n) ? Op::identity() : accumulator;
 
     __syncthreads();
@@ -157,15 +162,17 @@ compute_middle_sums(size_t n, typename Op::Data const *x, typename Op::Data *out
 #pragma unroll
     for (int i = 1; i < MIDDLE_THREADS; i <<= 1) {
 
-        Data add = (threadIdx.x >= i) ? shmem[threadIdx.x - i] : Op::identity();
+        Data add =
+            (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : Op::identity();
 
         __syncthreads();
-        shmem[threadIdx.x] = Op::combine(add, shmem[threadIdx.x]);
+        shmem[SHMEM_PADDING(threadIdx.x)] =
+            Op::combine(add, shmem[SHMEM_PADDING(threadIdx.x)]);
 
         __syncthreads();
     }
 
-    Data to_add = shmem[threadIdx.x];
+    Data to_add = shmem[SHMEM_PADDING(threadIdx.x)];
     //(threadIdx.x == 0) ? Op::identity() : shmem[threadIdx.x - 1]; //
 
     for (int i = 0; i < base_case; i++) {
@@ -260,14 +267,14 @@ typename Op::Data *launch_scan(
     Data *end_points = arr + n;
     Data *end_points_write = end_points + num_blocks;
     // std::cout << "num blocks: " << num_blocks << std::endl;
-    int shmem_bytes = sizeof(Data) * (THREAD_X * THREAD_Y);
+    int shmem_bytes = sizeof(Data) * (THREAD_X * THREAD_Y + PAD);
 
     int num_threads = CEIL_DIV(MIN(BLOCK, n), BASE); // should be 1024 at max sizes
 
     compute_sums<Op>
         <<<num_blocks, num_threads, shmem_bytes>>>(BLOCK, x, arr, end_points, n);
 
-    compute_middle_sums<Op><<<1, MIDDLE_THREADS, MIDDLE_THREADS * sizeof(Data)>>>(
+    compute_middle_sums<Op><<<1, MIDDLE_THREADS, (MIDDLE_THREADS + PAD) * sizeof(Data)>>>(
         num_blocks,
         end_points,
         end_points_write);
