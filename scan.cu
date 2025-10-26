@@ -206,11 +206,53 @@ __global__ void fill_blocks(
     }
 }
 
+template <typename Op>
+__global__ void fill_and_scan(
+    size_t n,
+    typename Op::Data *workspace,
+    size_t total_n,
+    typename Op::Data *end_sums,
+    typename Op::Data *small_sums) {
+    using Data = typename Op::Data;
+    extern __shared__ __align__(16) char shmem_raw[];
+    Data *shmem = reinterpret_cast<Data *>(shmem_raw);
+
+    Data *ref_arr = small_sums + blockIdx.x * blockDim.x;
+
+    shmem[(threadIdx.x)] = ref_arr[threadIdx.x];
+
+    __syncthreads();
+
+    // prefix sum on
+
+    Data val = Op::identity();
+    for (int i = 1; i < blockDim.x; i <<= 1) {
+
+        Data add = (threadIdx.x >= i) ? shmem[(threadIdx.x - i)] : Op::identity();
+
+        __syncthreads();
+        shmem[(threadIdx.x)] = Op::combine(add, shmem[(threadIdx.x)]);
+
+        __syncthreads();
+    }
+
+    Data *arr = workspace + blockIdx.x * (n - 1);
+    Data base = Op::identity();
+    if (blockIdx.x > 0) {
+        base = end_sums[blockIdx.x - 1];
+    }
+
+    for (size_t i = threadIdx.x; i < n; i += blockDim.x) {
+
+        arr[blockIdx.x + i] = Op::combine(base, shmem[(threadIdx.x)]);
+    }
+}
+
 // Returns desired size of scratch buffer in bytes.
 template <typename Op> size_t get_workspace_size(size_t n) {
     using Data = typename Op::Data;
     /* TODO: your CPU code here... */
-    return n * sizeof(Data) + 2 * CEIL_DIV(n, BLOCK) * sizeof(Data) +
+    return n * sizeof(Data) + 3 * CEIL_DIV(n, BLOCK) * sizeof(Data) +
         sizeof(Data) * MIDDLE_THREADS;
 }
 
@@ -265,6 +307,7 @@ typename Op::Data *launch_scan(
     Data *end_points = arr + n;
     Data *end_points_write = end_points + num_blocks;
     Data *end_points_write_2 = end_points_write + num_blocks;
+    Data *epw3 = end_points_write_2 + MIDDLE_THREADS;
 
     // std::cout << "num blocks: " << num_blocks << std::endl;
     int shmem_bytes = sizeof(Data) * (THREAD_X * THREAD_Y + PAD);
@@ -275,14 +318,6 @@ typename Op::Data *launch_scan(
         <<<num_blocks, num_threads, shmem_bytes>>>(BLOCK, x, arr, end_points, n);
 
     int l1_threads = CEIL_DIV(num_blocks, MIDDLE_THREADS);
-    if (n >= (1 << 19)) {
-        print_array<Op>(16, end_points);
-        printf(
-            "calling layer 1 with b: %d and t: %d and n blocks %d\n",
-            MIDDLE_THREADS,
-            l1_threads,
-            num_blocks);
-    }
 
     if (num_blocks > MIDDLE_THREADS) {
 
@@ -306,33 +341,22 @@ typename Op::Data *launch_scan(
                 end_points_write_2,
                 true);
     }
-    if (n >= (1 << 19)) {
-        print_array<Op>(16, end_points_write);
-        print_array<Op>(16, end_points_write_2);
-    }
 
     // fill in intermediate
     if (num_blocks > MIDDLE_THREADS) {
-        fill_blocks<Op><<<MIDDLE_THREADS - 1, l1_threads>>>(
+        fill_and_scan<Op><<<MIDDLE_THREADS, l1_threads, (l1_threads) * sizeof(Data)>>>(
             l1_threads,
-            end_points,
+            epw3,
             num_blocks,
             end_points_write_2,
-            end_points,
-            false);
-        end_points_write = end_points;
+            end_points);
+        // end_points_write = end_points;
     } else {
         // end_points = end_points_write;
-        end_points_write = end_points_write_2;
+        epw3 = end_points_write_2;
     }
 
-    if (n >= (1 << 19)) {
-        // print_array<Op>(16, end_points_write);
-        print_array<Op>(16, end_points_write);
-    }
-
-    fill_blocks<Op>
-        <<<num_blocks - 1, num_threads>>>(BLOCK, arr, n, end_points_write, arr, true);
+    fill_blocks<Op><<<num_blocks - 1, num_threads>>>(BLOCK, arr, n, epw3, arr, true);
     // }
 
     return arr; // replace with an appropriate pointer
