@@ -51,17 +51,226 @@ void rle_compress_cpu(
 
 /// <--- your code here --->
 
+namespace rle_gpu {
+#define THREADS (4 * 32)
+// #define BLOCK (1 << 12)
+#define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
+// #define BASE (BLOCK / (THREAD_X * THREAD_Y))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+// #define MIDDLE_THREADS (16 * 32)
+
+#define PAD 32
+#define SHMEM_PADDING(idx) ((idx) + ((idx) / PAD))
+
+/* TODO: your GPU kernels here... */
+
+__global__ void reduce(size_t n, uint32_t const *x, uint32_t *out) {
+
+    uint32_t const *x_block = x + blockIdx.x * blockDim.x;
+
+    extern __shared__ __align__(16) char shmem_raw[];
+    uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
+
+    shmem[SHMEM_PADDING(threadIdx.x)] = x_block[threadIdx.x];
+
+    __syncthreads();
+
+    for (int i = 1; i < THREADS; i <<= 1) {
+        uint32_t add = (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : 0;
+        __syncthreads();
+        shmem[SHMEM_PADDING(threadIdx.x)] = add + shmem[SHMEM_PADDING(threadIdx.x)];
+        __syncthreads();
+    }
+
+    // TODO: account for blocks with not full THREADS length
+
+    int last = MIN((int)n - (int)(blockIdx.x * blockDim.x), (int)blockDim.x) - 1;
+    out[blockIdx.x] = shmem[SHMEM_PADDING(last)];
+}
+
+__global__ void scan_block(size_t n, uint32_t const *x, uint32_t *out) {
+    uint32_t accumulator = 0;
+
+    extern __shared__ __align__(16) char shmem_raw[];
+    uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
+
+    shmem[SHMEM_PADDING(threadIdx.x)] = x[threadIdx.x];
+
+    __syncthreads();
+
+    for (int i = 1; i < THREADS; i <<= 1) {
+        uint32_t add = (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : 0;
+        __syncthreads();
+        shmem[SHMEM_PADDING(threadIdx.x)] = add + shmem[SHMEM_PADDING(threadIdx.x)];
+        __syncthreads();
+    }
+    if (threadIdx.x < n)
+        out[threadIdx.x] = shmem[SHMEM_PADDING(threadIdx.x)];
+}
+
+__global__ void
+scan(size_t n, uint32_t const *x, uint32_t const *end_points, uint32_t *out) {
+
+    extern __shared__ __align__(16) char shmem_raw[];
+    uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
+
+    uint32_t const *x_block = x + blockIdx.x * blockDim.x;
+    uint32_t *out_block = out + blockIdx.x * blockDim.x;
+
+    shmem[SHMEM_PADDING(threadIdx.x)] = x_block[threadIdx.x];
+
+    __syncthreads();
+
+    for (int i = 1; i < THREADS; i <<= 1) {
+        uint32_t add = (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : 0;
+        __syncthreads();
+        shmem[SHMEM_PADDING(threadIdx.x)] = add + shmem[SHMEM_PADDING(threadIdx.x)];
+        __syncthreads();
+    }
+    uint32_t block_carry = (blockIdx.x == 0) ? 0 : end_points[blockIdx.x - 1];
+    out_block[threadIdx.x] = block_carry + shmem[SHMEM_PADDING(threadIdx.x)];
+}
+
+// Returns desired size of scratch buffer in bytes.
+size_t get_workspace_size_scan(size_t n) {
+    /* TODO: your CPU code here... */
+    size_t total = n;
+    size_t size = n;
+    while (size > THREADS) {
+        total += size;
+        size = CEIL_DIV(size, THREADS);
+    }
+
+    return 2 * total * sizeof(uint32_t);
+}
+
+// 'launch_scan'
+//
+
+uint32_t *launch_scan(
+    size_t n,
+    uint32_t *x,    // pointer to GPU memory
+    void *workspace // pointer to GPU memory
+) {
+    /* TODO: your CPU code here... */
+    uint32_t *arr = reinterpret_cast<uint32_t *>(workspace); // size n
+    uint32_t *data = x;
+
+    // compute sums per block
+
+    size_t size = n;
+    size_t offsets[8];
+    offsets[0] = 0;
+    int iter = 1;
+
+    while (size > THREADS) {
+        size_t blocks = CEIL_DIV(size, THREADS);
+        reduce<<<blocks, THREADS, (THREADS + PAD) * sizeof(uint32_t)>>>(
+            size,
+            data,
+            arr + offsets[iter - 1]);
+
+        size = blocks;
+        data = arr + offsets[iter - 1];
+
+        offsets[iter] = offsets[iter - 1] + size;
+        iter++;
+    }
+    iter--;
+
+    uint32_t *final_block = (iter == 0) ? data : arr + offsets[iter];
+    size_t threads = MIN(THREADS, n);
+
+    uint32_t *base_out = (iter == 0) ? arr : final_block + threads;
+
+    scan_block<<<1, threads, (threads + PAD) * sizeof(uint32_t)>>>(
+        size,
+        final_block,
+        base_out);
+
+    size_t larger_size = threads;
+    base_out += larger_size;
+    uint32_t *end_points = arr + offsets[iter];
+    if (n > THREADS) {
+        while (iter >= 0) {
+
+            larger_size = (iter == 0) ? n : (offsets[iter] - offsets[iter - 1]);
+            size_t blocks = CEIL_DIV(larger_size, THREADS);
+
+            uint32_t *data_ptr = (iter == 0) ? x : arr + offsets[iter - 1];
+            scan<<<blocks, THREADS, (THREADS + PAD) * sizeof(uint32_t)>>>(
+                larger_size,
+                data_ptr,
+                end_points,
+                base_out);
+
+            size = larger_size;
+            iter--;
+            end_points = base_out;
+
+            base_out += larger_size;
+        }
+    }
+
+    return base_out - larger_size; // replace with an appropriate pointer
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
-namespace rle_gpu {
-
 /* TODO: your GPU kernels here... */
+
+__global__ void make_mask(uint32_t size, const char *data, uint32_t *out) {
+    int offset = blockIdx.x * blockDim.x + threadIdx.x;
+    if (offset == 0) {
+        out[offset] = 1;
+    } else if (offset < size) {
+        if (data[offset] != data[offset - 1])
+            out[offset] = 1;
+        else
+            out[offset] = 0;
+    }
+}
+
+__global__ void make_compress(
+    uint32_t size,
+    const char *data,
+    uint32_t *binary_scan,
+    char *compressed_data,
+    uint32_t *compressed_lengths) {
+
+    int offset = blockIdx.x * blockDim.x + threadIdx.x;
+    if (offset < size) {
+
+        char elt = data[offset];
+        int idx = binary_scan[offset] - 1; // for indexing
+        if (offset == size - 1 || data[offset] != data[offset + 1]) {
+            compressed_data[idx] = elt;
+            compressed_lengths[idx] = offset;
+        }
+    }
+}
+
+__global__ void fix_compress(
+    uint32_t *global_compress,
+    uint32_t *compressed_lengths,
+    uint32_t compressed_count) {
+    uint32_t offset = blockIdx.x * blockDim.x + threadIdx.x;
+    if (offset < compressed_count) {
+
+        if (offset > 0) {
+            compressed_lengths[offset] =
+                global_compress[offset] - global_compress[offset - 1];
+        } else {
+            compressed_lengths[offset] = global_compress[offset] + 1;
+        }
+    }
+}
 
 // Returns desired size of scratch buffer in bytes.
 size_t get_workspace_size(uint32_t raw_count) {
     /* TODO: your CPU code here... */
-    return 0;
+    return get_workspace_size_scan(raw_count) + 2 * raw_count * sizeof(uint32_t);
 }
 
 // 'launch_rle_compress'
@@ -77,16 +286,20 @@ size_t get_workspace_size(uint32_t raw_count) {
 //
 // Output:
 //
-//   Returns: 'compressed_count', the number of runs in the compressed data.
+//   Returns: 'compressed_count', the number of runs in the compressed uint32_t.
 //
 //   'compressed_data': Output buffer of size 'raw_count' in GPU memory. The
 //   function should fill the first 'compressed_count' bytes of this buffer
-//   with the compressed data.
+//   with the compressed uint32_t.
 //
 //   'compressed_lengths': Output buffer of size 'raw_count' in GPU memory. The
 //   function should fill the first 'compressed_count' integers in this buffer
-//   with the lengths of the runs in the compressed data.
+//   with the lengths of the runs in the compressed uint32_t.
 //
+
+#define THREADS_RLE (32 * 32)
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
 uint32_t launch_rle_compress(
     uint32_t raw_count,
     char const *raw,             // pointer to GPU buffer
@@ -96,6 +309,35 @@ uint32_t launch_rle_compress(
 ) {
     /* TODO: your CPU code here... */
     uint32_t compressed_count = 0;
+
+    int blocks = CEIL_DIV(raw_count, THREADS_RLE);
+    uint32_t *binary = reinterpret_cast<uint32_t *>(
+        reinterpret_cast<char *>(workspace) +
+        static_cast<size_t>(get_workspace_size_scan(raw_count)));
+
+    uint32_t *compress_global = binary + raw_count;
+    make_mask<<<blocks, THREADS_RLE>>>(raw_count, raw, binary);
+
+    uint32_t *binary_sum = launch_scan(raw_count, binary, workspace);
+
+    make_compress<<<blocks, THREADS_RLE>>>(
+        raw_count,
+        raw,
+        binary_sum,
+        compressed_data,
+        compress_global);
+
+    CUDA_CHECK(cudaMemcpy(
+        &compressed_count,
+        &(binary_sum[raw_count - 1]),
+        sizeof(uint32_t),
+        cudaMemcpyDeviceToHost));
+
+    fix_compress<<<CEIL_DIV(compressed_count, THREADS_RLE), THREADS_RLE>>>(
+        compress_global,
+        compressed_lengths,
+        compressed_count);
+
     return compressed_count;
 }
 

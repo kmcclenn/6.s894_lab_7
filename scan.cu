@@ -48,212 +48,117 @@ void scan_cpu(size_t n, typename Op::Data const *x, typename Op::Data *out) {
 // Optimized GPU Implementation
 
 namespace scan_gpu {
-#define THREAD_X 32
-#define THREAD_Y 32
-#define BLOCK (1 << 12)
+// #define THREAD_X 32
+// #define THREAD_Y 32
+#define THREADS (4 * 32)
+// #define BLOCK (1 << 12)
 #define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
-#define BASE (BLOCK / (THREAD_X * THREAD_Y))
+// #define BASE (BLOCK / (THREAD_X * THREAD_Y))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define MIDDLE_THREADS (32 * 32)
+// #define MIDDLE_THREADS (16 * 32)
 
 #define PAD 32
 #define SHMEM_PADDING(idx) ((idx) + ((idx) / PAD))
 
 /* TODO: your GPU kernels here... */
-template <typename Op>
-__global__ void compute_sums(
-    size_t n,
-    typename Op::Data const *x,
-    typename Op::Data *out,
-    typename Op::Data *end_sums,
-    size_t total_n) {
 
+template <typename Op>
+__global__ void reduce(size_t n, typename Op::Data const *x, typename Op::Data *out) {
     using Data = typename Op::Data;
     Data accumulator = Op::identity();
 
-    size_t offset = blockIdx.x * BLOCK + threadIdx.x * BASE;
-
-    Data const *x_block = x + offset;
-    Data *out_block = out + offset;
-
-    size_t remaining = total_n - offset;
-    int less_than_base = remaining < BASE;
-    size_t loop_bound = less_than_base * remaining + (1 - less_than_base) * BASE;
-
-    if (offset >= total_n)
-        return;
+    Data const *x_block = x + blockIdx.x * blockDim.x;
 
     extern __shared__ __align__(16) char shmem_raw[];
     Data *shmem = reinterpret_cast<Data *>(shmem_raw);
 
-    for (size_t i = 0; i < loop_bound; i++) { // BASE
-        accumulator = Op::combine(accumulator, x_block[i]);
-        out_block[i] = accumulator;
-    }
-    shmem[0] = Op::identity();
-    shmem[SHMEM_PADDING(threadIdx.x + 1)] = accumulator;
-    //(threadIdx.x >= n) ? Op::identity() : accumulator;
+    shmem[SHMEM_PADDING(threadIdx.x)] = x_block[threadIdx.x];
 
     __syncthreads();
 
-    // prefix sum on
-    int num_threads = CEIL_DIV(MIN(BLOCK, total_n), BASE);
-
-#pragma unroll
-    for (int i = 1; i < num_threads; i <<= 1) {
-
+    for (int i = 1; i < THREADS; i <<= 1) {
         Data add =
             (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : Op::identity();
-
         __syncthreads();
-
         shmem[SHMEM_PADDING(threadIdx.x)] =
             Op::combine(add, shmem[SHMEM_PADDING(threadIdx.x)]);
-        // }
         __syncthreads();
     }
 
-    Data to_add = shmem[SHMEM_PADDING(threadIdx.x)]; //
+    // TODO: account for blocks with not full THREADS length
 
-    for (int i = 0; i < loop_bound; i++) {
-
-        // if (offset + i < total_n)
-        out_block[i] = Op::combine(to_add, out_block[i]); //
-    }
-    // __syncthreads();
-    if (threadIdx.x == blockDim.x - 1) {
-
-        end_sums[blockIdx.x] = out_block[BASE - 1];
-    }
+    int last = MIN((int)n - (int)(blockIdx.x * blockDim.x), (int)blockDim.x) - 1;
+    out[blockIdx.x] = shmem[SHMEM_PADDING(last)];
 }
 
-// TODO: fix hardcoding
 template <typename Op>
-__global__ void compute_middle_sums(
-    size_t n,
-    typename Op::Data const *x,
-    typename Op::Data *out,
-    bool add_accumulation) {
+__global__ void scan_block(size_t n, typename Op::Data const *x, typename Op::Data *out) {
     using Data = typename Op::Data;
     Data accumulator = Op::identity();
 
-    int base_case = CEIL_DIV(n, blockDim.x);
-    //
-    // int offset = blockIdx.x * gridDim.x + threadIdx.x * base_case; // hardcoded to 4
-
-    Data const *x_block = x + blockIdx.x * blockDim.x + threadIdx.x;
-
-    // Data *out_block = out + blockIdx.x * gridDim.x + threadIdx.x;
-
-    // if (offset >= n)
-    //     return;
-
     extern __shared__ __align__(16) char shmem_raw[];
     Data *shmem = reinterpret_cast<Data *>(shmem_raw);
 
-    // partial sum from threadIdx block
-
-    shmem[SHMEM_PADDING(threadIdx.x)] = x_block[0];
+    shmem[SHMEM_PADDING(threadIdx.x)] = x[threadIdx.x];
 
     __syncthreads();
 
-    // prefix sum on
-    Data to_add = Op::identity();
-    Data val = Op::identity();
-
-#pragma unroll
-
-    for (int i = 1; i < blockDim.x; i <<= 1) {
-
+    for (int i = 1; i < THREADS; i <<= 1) {
         Data add =
             (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : Op::identity();
-
         __syncthreads();
-        val = Op::combine(add, shmem[SHMEM_PADDING(threadIdx.x)]);
-        shmem[SHMEM_PADDING(threadIdx.x)] = val;
-
+        shmem[SHMEM_PADDING(threadIdx.x)] =
+            Op::combine(add, shmem[SHMEM_PADDING(threadIdx.x)]);
         __syncthreads();
     }
-
-    if (add_accumulation) {
-        if (threadIdx.x < n)
-            out[threadIdx.x] = val;
-    } else {
-        if (threadIdx.x == blockDim.x - 1) {
-            out[blockIdx.x] = shmem[SHMEM_PADDING(blockDim.x - 1)];
-        }
-    }
+    if (threadIdx.x < n)
+        out[threadIdx.x] = shmem[SHMEM_PADDING(threadIdx.x)];
 }
 
 template <typename Op>
-__global__ void fill_blocks(
+__global__ void scan(
     size_t n,
-    typename Op::Data *workspace,
-    size_t total_n,
-    typename Op::Data *end_sums,
-    typename Op::Data *small_sums,
-    bool leaf) {
+    typename Op::Data const *x,
+    typename Op::Data const *end_points,
+    typename Op::Data *out) {
+
     using Data = typename Op::Data;
-    Data *arr = workspace + (blockIdx.x + 1) * n;
+    Data accumulator = Op::identity();
 
-    Data base = end_sums[blockIdx.x];                                      //*(arr - 1);
-    int end = (blockIdx.x == gridDim.x - 1) ? ((total_n - 1) % n) + 1 : n; //
-    if (leaf)
-        small_sums += (blockIdx.x + 1) * n;
-    for (size_t i = threadIdx.x; i < end; i += blockDim.x) {
-
-        arr[i] = Op::combine(base, small_sums[i]);
-    }
-}
-
-template <typename Op>
-__global__ void fill_and_scan(
-    size_t n,
-    typename Op::Data *workspace,
-    size_t total_n,
-    typename Op::Data *end_sums,
-    typename Op::Data *small_sums) {
-    using Data = typename Op::Data;
     extern __shared__ __align__(16) char shmem_raw[];
     Data *shmem = reinterpret_cast<Data *>(shmem_raw);
 
-    Data *ref_arr = small_sums + blockIdx.x * blockDim.x;
+    Data const *x_block = x + blockIdx.x * blockDim.x;
+    Data *out_block = out + blockIdx.x * blockDim.x;
 
-    shmem[(threadIdx.x)] = ref_arr[threadIdx.x];
+    shmem[SHMEM_PADDING(threadIdx.x)] = x_block[threadIdx.x];
 
     __syncthreads();
 
-    // prefix sum on
-
-    Data val = Op::identity();
-    for (int i = 1; i < blockDim.x; i <<= 1) {
-
-        Data add = (threadIdx.x >= i) ? shmem[(threadIdx.x - i)] : Op::identity();
-
+    for (int i = 1; i < THREADS; i <<= 1) {
+        Data add =
+            (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : Op::identity();
         __syncthreads();
-        shmem[(threadIdx.x)] = Op::combine(add, shmem[(threadIdx.x)]);
-
+        shmem[SHMEM_PADDING(threadIdx.x)] =
+            Op::combine(add, shmem[SHMEM_PADDING(threadIdx.x)]);
         __syncthreads();
     }
-
-    Data *arr = workspace + blockIdx.x * (n - 1);
-    Data base = Op::identity();
-    if (blockIdx.x > 0) {
-        base = end_sums[blockIdx.x - 1];
-    }
-
-    for (size_t i = threadIdx.x; i < n; i += blockDim.x) {
-
-        arr[blockIdx.x + i] = Op::combine(base, shmem[(threadIdx.x)]);
-    }
+    Data block_carry = (blockIdx.x == 0) ? Op::identity() : end_points[blockIdx.x - 1];
+    out_block[threadIdx.x] = Op::combine(block_carry, shmem[SHMEM_PADDING(threadIdx.x)]);
 }
 
 // Returns desired size of scratch buffer in bytes.
 template <typename Op> size_t get_workspace_size(size_t n) {
     using Data = typename Op::Data;
     /* TODO: your CPU code here... */
-    return n * sizeof(Data) + 3 * CEIL_DIV(n, BLOCK) * sizeof(Data) +
-        sizeof(Data) * MIDDLE_THREADS;
+    size_t total = n;
+    size_t size = n;
+    while (size > THREADS) {
+        total += size;
+        size = CEIL_DIV(size, THREADS);
+    }
+
+    return 2 * total * sizeof(Data);
 }
 
 // 'launch_scan'
@@ -301,65 +206,63 @@ typename Op::Data *launch_scan(
     using Data = typename Op::Data;
     /* TODO: your CPU code here... */
     Data *arr = reinterpret_cast<Data *>(workspace); // size n
+    Data *data = x;
 
     // compute sums per block
-    int num_blocks = CEIL_DIV(n, BLOCK);
-    Data *end_points = arr + n;
-    Data *end_points_write = end_points + num_blocks;
-    Data *end_points_write_2 = end_points_write + num_blocks;
-    Data *epw3 = end_points_write_2 + MIDDLE_THREADS;
 
-    // std::cout << "num blocks: " << num_blocks << std::endl;
-    int shmem_bytes = sizeof(Data) * (THREAD_X * THREAD_Y + PAD);
+    size_t size = n;
+    size_t offsets[8];
+    offsets[0] = 0;
+    int iter = 1;
 
-    int num_threads = CEIL_DIV(MIN(BLOCK, n), BASE); // should be 1024 at max sizes
+    while (size > THREADS) {
+        size_t blocks = CEIL_DIV(size, THREADS);
+        reduce<Op><<<blocks, THREADS, (THREADS + PAD) * sizeof(Data)>>>(
+            size,
+            data,
+            arr + offsets[iter - 1]);
 
-    compute_sums<Op>
-        <<<num_blocks, num_threads, shmem_bytes>>>(BLOCK, x, arr, end_points, n);
+        size = blocks;
+        data = arr + offsets[iter - 1];
 
-    int l1_threads = CEIL_DIV(num_blocks, MIDDLE_THREADS);
+        offsets[iter] = offsets[iter - 1] + size;
+        iter++;
+    }
+    iter--;
 
-    if (num_blocks > MIDDLE_THREADS) {
+    Data *final_block = (iter == 0) ? data : arr + offsets[iter];
+    size_t threads = MIN(THREADS, n);
 
-        compute_middle_sums<Op>
-            <<<MIDDLE_THREADS, l1_threads, (l1_threads + PAD) * sizeof(Data)>>>(
-                l1_threads,
+    Data *base_out = (iter == 0) ? arr : final_block + threads;
+
+    scan_block<Op>
+        <<<1, threads, (threads + PAD) * sizeof(Data)>>>(size, final_block, base_out);
+
+    size_t larger_size = threads;
+    base_out += larger_size;
+    Data *end_points = arr + offsets[iter];
+    if (n > THREADS) {
+        while (iter >= 0) {
+
+            larger_size = (iter == 0) ? n : (offsets[iter] - offsets[iter - 1]);
+            size_t blocks = CEIL_DIV(larger_size, THREADS);
+
+            Data *data_ptr = (iter == 0) ? x : arr + offsets[iter - 1];
+            scan<Op><<<blocks, THREADS, (THREADS + PAD) * sizeof(Data)>>>(
+                larger_size,
+                data_ptr,
                 end_points,
-                end_points_write,
-                false);
-        compute_middle_sums<Op>
-            <<<1, MIDDLE_THREADS, (MIDDLE_THREADS + PAD) * sizeof(Data)>>>(
-                MIDDLE_THREADS,
-                end_points_write,
-                end_points_write_2,
-                true);
-    } else {
-        compute_middle_sums<Op>
-            <<<1, MIDDLE_THREADS, (MIDDLE_THREADS + PAD) * sizeof(Data)>>>(
-                MIN(MIDDLE_THREADS, num_blocks),
-                end_points,
-                end_points_write_2,
-                true);
+                base_out);
+
+            size = larger_size;
+            iter--;
+            end_points = base_out;
+
+            base_out += larger_size;
+        }
     }
 
-    // fill in intermediate
-    if (num_blocks > MIDDLE_THREADS) {
-        fill_and_scan<Op><<<MIDDLE_THREADS, l1_threads, (l1_threads) * sizeof(Data)>>>(
-            l1_threads,
-            epw3,
-            num_blocks,
-            end_points_write_2,
-            end_points);
-        // end_points_write = end_points;
-    } else {
-        // end_points = end_points_write;
-        epw3 = end_points_write_2;
-    }
-
-    fill_blocks<Op><<<num_blocks - 1, num_threads>>>(BLOCK, arr, n, epw3, arr, true);
-    // }
-
-    return arr; // replace with an appropriate pointer
+    return base_out - larger_size; // replace with an appropriate pointer
 }
 
 } // namespace scan_gpu
